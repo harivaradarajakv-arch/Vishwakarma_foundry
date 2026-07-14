@@ -98,10 +98,14 @@ app.use('/api/payments', paymentRoutes);
 app.use('/api/warranty', warrantyRoutes);
 app.use('/api/reviews', reviewRoutes);
 
-// Static files for uploads
+// Static files for uploads (handled safely for serverless environments like Vercel)
 const uploadDir = path.join(__dirname, 'uploads');
-if (!fs.existsSync(uploadDir)) {
-  fs.mkdirSync(uploadDir, { recursive: true });
+try {
+  if (!fs.existsSync(uploadDir)) {
+    fs.mkdirSync(uploadDir, { recursive: true });
+  }
+} catch (err) {
+  console.warn('Could not create uploads directory (expected in serverless/Vercel):', err.message);
 }
 app.use('/uploads', express.static(uploadDir));
 
