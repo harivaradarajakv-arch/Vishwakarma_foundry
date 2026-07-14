@@ -1,68 +1,51 @@
 const express = require('express');
 const multer = require('multer');
 const sharp = require('sharp');
-const cloudinary = require('cloudinary').v2;
-const { CloudinaryStorage } = require('multer-storage-cloudinary');
+const supabase = require('../utils/supabase');
 const { auth } = require('../middleware/auth');
 
 const router = express.Router();
 
-// Configure Cloudinary
-const isCloudinaryConfigured = 
-  process.env.CLOUDINARY_CLOUD_NAME && 
-  process.env.CLOUDINARY_CLOUD_NAME !== 'your_cloud_name' &&
-  process.env.CLOUDINARY_API_KEY && 
-  process.env.CLOUDINARY_API_KEY !== 'your_api_key';
+const BUCKET_NAME = 'vishwakarma'; // Bucket name in Supabase Storage
 
-if (isCloudinaryConfigured) {
-  cloudinary.config({
-    cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
-    api_key: process.env.CLOUDINARY_API_KEY,
-    api_secret: process.env.CLOUDINARY_API_SECRET
-  });
-} else {
-  console.warn('Cloudinary not configured or using placeholder keys. Falling back to local storage.');
-}
-
-// Configure storage for different file types
-const imageStorage = new CloudinaryStorage({
-  cloudinary: cloudinary,
-  params: {
-    folder: 'vishwakarma-foundry/products',
-    allowed_formats: ['jpg', 'jpeg', 'png', 'webp'],
-    transformation: [
-      { width: 1200, height: 800, crop: 'limit', quality: 'auto' },
-      { fetch_format: 'auto' }
-    ]
+// Ensure the bucket exists and is public
+const ensureBucketExists = async () => {
+  try {
+    const { data: buckets, error } = await supabase.storage.listBuckets();
+    if (error) throw error;
+    
+    const exists = buckets.some(b => b.name === BUCKET_NAME);
+    if (!exists) {
+      const { error: createError } = await supabase.storage.createBucket(BUCKET_NAME, {
+        public: true,
+        allowedMimeTypes: [
+          'image/jpeg', 
+          'image/png', 
+          'image/webp', 
+          'application/pdf', 
+          'application/msword', 
+          'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+        ],
+        fileSizeLimit: 10 * 1024 * 1024 // 10MB limit
+      });
+      if (createError) throw createError;
+      console.log(`Created Supabase storage bucket: ${BUCKET_NAME}`);
+    }
+  } catch (err) {
+    console.error('Error ensuring Supabase storage bucket exists:', err.message);
   }
-});
+};
 
-const documentStorage = new CloudinaryStorage({
-  cloudinary: cloudinary,
-  params: {
-    folder: 'vishwakarma-foundry/documents',
-    allowed_formats: ['pdf', 'doc', 'docx'],
-    resource_type: 'auto'
-  }
-});
+// Check bucket on startup
+ensureBucketExists();
 
-// Configure local storage fallback
-const localDiskStorage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, 'uploads/');
-  },
-  filename: (req, file, cb) => {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    const extension = file.originalname.split('.').pop();
-    cb(null, `${uniqueSuffix}.${extension}`);
-  }
-});
+// Multer configured to use Memory Storage so we get the file buffer
+const storage = multer.memoryStorage();
 
-// Initialize multer
 const uploadImage = multer({
-  storage: isCloudinaryConfigured ? imageStorage : localDiskStorage,
+  storage: storage,
   limits: {
-    fileSize: 5 * 1024 * 1024, // 5MB
+    fileSize: 5 * 1024 * 1024, // 5MB limit
   },
   fileFilter: (req, file, cb) => {
     if (file.mimetype.startsWith('image/')) {
@@ -74,12 +57,16 @@ const uploadImage = multer({
 });
 
 const uploadDocument = multer({
-  storage: isCloudinaryConfigured ? documentStorage : localDiskStorage,
+  storage: storage,
   limits: {
-    fileSize: 10 * 1024 * 1024, // 10MB
+    fileSize: 10 * 1024 * 1024, // 10MB limit
   },
   fileFilter: (req, file, cb) => {
-    const allowedTypes = ['application/pdf', 'application/msword', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'];
+    const allowedTypes = [
+      'application/pdf', 
+      'application/msword', 
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+    ];
     if (allowedTypes.includes(file.mimetype)) {
       cb(null, true);
     } else {
@@ -87,6 +74,38 @@ const uploadDocument = multer({
     }
   }
 });
+
+// Generic helper to upload file buffer to Supabase Storage
+const uploadToSupabase = async (buffer, folder, originalName, mimeType) => {
+  // Double check bucket existence
+  await ensureBucketExists();
+
+  const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+  const extension = originalName.split('.').pop();
+  const fileName = `${uniqueSuffix}.${extension}`;
+  const filePath = `${folder}/${fileName}`;
+
+  const { data, error } = await supabase.storage
+    .from(BUCKET_NAME)
+    .upload(filePath, buffer, {
+      contentType: mimeType,
+      upsert: true
+    });
+
+  if (error) {
+    throw error;
+  }
+
+  // Retrieve the public URL
+  const { data: { publicUrl } } = supabase.storage
+    .from(BUCKET_NAME)
+    .getPublicUrl(filePath);
+
+  return {
+    url: publicUrl,
+    publicId: filePath // Keep publicId as the filePath in Supabase
+  };
+};
 
 // @route   POST /api/upload/images
 // @desc    Upload multiple images
@@ -100,33 +119,35 @@ router.post('/images', auth, uploadImage.array('images', 10), async (req, res) =
       });
     }
 
-    const uploadedImages = req.files.map(file => {
-      let url = file.path;
-      if (!isCloudinaryConfigured) {
-        // Construct local URL
-        const baseUrl = `${req.protocol}://${req.get('host')}`;
-        url = `${baseUrl}/uploads/${file.filename}`;
-      }
+    const uploadPromises = req.files.map(async (file) => {
+      const { url, publicId } = await uploadToSupabase(
+        file.buffer,
+        'products',
+        file.originalname,
+        file.mimetype
+      );
       
       return {
         url: url,
-        publicId: file.filename || file.path,
+        publicId: publicId,
         originalName: file.originalname,
         size: file.size,
         mimeType: file.mimetype
       };
     });
 
+    const uploadedImages = await Promise.all(uploadPromises);
+
     res.json({
       success: true,
-      message: 'Images uploaded successfully',
+      message: 'Images uploaded successfully to Supabase',
       images: uploadedImages
     });
   } catch (error) {
     console.error('Image upload error:', error);
     res.status(500).json({
       success: false,
-      message: 'Error uploading images'
+      message: 'Error uploading images to Supabase'
     });
   }
 });
@@ -143,24 +164,35 @@ router.post('/documents', auth, uploadDocument.array('documents', 5), async (req
       });
     }
 
-    const uploadedDocuments = req.files.map(file => ({
-      url: file.path,
-      publicId: file.filename,
-      originalName: file.originalname,
-      size: file.size,
-      mimeType: file.mimetype
-    }));
+    const uploadPromises = req.files.map(async (file) => {
+      const { url, publicId } = await uploadToSupabase(
+        file.buffer,
+        'documents',
+        file.originalname,
+        file.mimetype
+      );
+      
+      return {
+        url: url,
+        publicId: publicId,
+        originalName: file.originalname,
+        size: file.size,
+        mimeType: file.mimetype
+      };
+    });
+
+    const uploadedDocuments = await Promise.all(uploadPromises);
 
     res.json({
       success: true,
-      message: 'Documents uploaded successfully',
+      message: 'Documents uploaded successfully to Supabase',
       documents: uploadedDocuments
     });
   } catch (error) {
     console.error('Document upload error:', error);
     res.status(500).json({
       success: false,
-      message: 'Error uploading documents'
+      message: 'Error uploading documents to Supabase'
     });
   }
 });
@@ -180,6 +212,14 @@ router.post('/product-gallery', auth, uploadImage.array('gallery', 8), async (re
     // Process images with Sharp for optimization
     const processedImages = await Promise.all(
       req.files.map(async (file, index) => {
+        // Upload original first
+        const { url: originalUrl, publicId: originalPublicId } = await uploadToSupabase(
+          file.buffer,
+          'products/original',
+          file.originalname,
+          file.mimetype
+        );
+
         // Create different sizes
         const sizes = [
           { name: 'thumbnail', width: 150, height: 150 },
@@ -198,24 +238,16 @@ router.post('/product-gallery', auth, uploadImage.array('gallery', 8), async (re
             .jpeg({ quality: 80 })
             .toBuffer();
 
-          // Upload each size to Cloudinary
-          const result = await new Promise((resolve, reject) => {
-            cloudinary.uploader.upload_stream(
-              {
-                folder: `vishwakarma-foundry/products/${size.name}`,
-                public_id: `${file.filename}_${size.name}`,
-                resource_type: 'image'
-              },
-              (error, result) => {
-                if (error) reject(error);
-                else resolve(result);
-              }
-            ).end(buffer);
-          });
+          const { url: sizeUrl, publicId: sizePublicId } = await uploadToSupabase(
+            buffer,
+            `products/${size.name}`,
+            `size_${size.name}_${file.originalname}`,
+            'image/jpeg'
+          );
 
           processedSizes[size.name] = {
-            url: result.secure_url,
-            publicId: result.public_id,
+            url: sizeUrl,
+            publicId: sizePublicId,
             width: size.width,
             height: size.height
           };
@@ -223,8 +255,8 @@ router.post('/product-gallery', auth, uploadImage.array('gallery', 8), async (re
 
         return {
           original: {
-            url: file.path,
-            publicId: file.filename,
+            url: originalUrl,
+            publicId: originalPublicId,
             originalName: file.originalname,
             size: file.size,
             mimeType: file.mimetype
@@ -237,74 +269,74 @@ router.post('/product-gallery', auth, uploadImage.array('gallery', 8), async (re
 
     res.json({
       success: true,
-      message: 'Product gallery uploaded and processed successfully',
+      message: 'Product gallery uploaded and processed successfully to Supabase',
       images: processedImages
     });
   } catch (error) {
     console.error('Gallery upload error:', error);
     res.status(500).json({
       success: false,
-      message: 'Error uploading gallery'
+      message: 'Error uploading gallery to Supabase'
     });
   }
 });
 
-// @route   DELETE /api/upload/:publicId
-// @desc    Delete uploaded file
+// @route   DELETE /api/upload/*
+// @desc    Delete uploaded file (wildcard to match folder paths)
 // @access  Private
-router.delete('/:publicId', auth, async (req, res) => {
+router.delete('/*', auth, async (req, res) => {
   try {
-    const { publicId } = req.params;
+    const publicId = req.params[0];
 
-    // Delete from Cloudinary if configured
-    let result;
-    if (isCloudinaryConfigured && !publicId.includes('.')) {
-      result = await cloudinary.uploader.destroy(publicId);
-    } else {
-      // For local files, we might just skip or implement local deletion
-      // For now, we'll return a mock success to avoid breaking the frontend
-      result = { result: 'ok' };
-    }
-
-    if (result.result === 'ok') {
-      res.json({
-        success: true,
-        message: 'File deleted successfully'
-      });
-    } else {
-      res.status(404).json({
+    if (!publicId) {
+      return res.status(400).json({
         success: false,
-        message: 'File not found or already deleted'
+        message: 'No file path provided for deletion'
       });
     }
+
+    const { data, error } = await supabase.storage
+      .from(BUCKET_NAME)
+      .remove([publicId]);
+
+    if (error) {
+      throw error;
+    }
+
+    res.json({
+      success: true,
+      message: 'File deleted successfully from Supabase'
+    });
   } catch (error) {
     console.error('File deletion error:', error);
     res.status(500).json({
       success: false,
-      message: 'Error deleting file'
+      message: 'Error deleting file from Supabase'
     });
   }
 });
 
-// @route   GET /api/upload/info/:publicId
-// @desc    Get file information
+// @route   GET /api/upload/info/*
+// @desc    Get file information (wildcard to match folder paths)
 // @access  Private
-router.get('/info/:publicId', auth, async (req, res) => {
+router.get('/info/*', auth, async (req, res) => {
   try {
-    const { publicId } = req.params;
+    const publicId = req.params[0];
 
-    const result = await cloudinary.api.resource(publicId);
+    if (!publicId) {
+      return res.status(400).json({
+        success: false,
+        message: 'No file path provided'
+      });
+    }
 
     res.json({
       success: true,
       file: {
-        publicId: result.public_id,
-        url: result.secure_url,
-        format: result.format,
-        size: result.bytes,
-        width: result.width,
-        height: result.height,
-        createdAt: result.created_at
+        publicId: publicId,
+        url: supabase.storage.from(BUCKET_NAME).getPublicUrl(publicId).data.publicUrl,
+        format: publicId.split('.').pop(),
+        createdAt: new Date().toISOString()
       }
     });
   } catch (error) {

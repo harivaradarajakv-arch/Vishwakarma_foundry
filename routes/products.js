@@ -397,9 +397,42 @@ router.delete('/:id', [auth, authorize('admin')], async (req, res) => {
       });
     }
 
-    // Soft delete by changing status
-    product.status = 'discontinued';
-    await product.save();
+    // Recursively gather all publicIds to delete associated files from Supabase Storage
+    const pathsToDelete = [];
+    const extractPublicIds = (obj) => {
+      if (!obj) return;
+      if (typeof obj === 'object') {
+        if (obj.publicId && typeof obj.publicId === 'string') {
+          pathsToDelete.push(obj.publicId);
+        }
+        for (const key in obj) {
+          if (Object.prototype.hasOwnProperty.call(obj, key)) {
+            extractPublicIds(obj[key]);
+          }
+        }
+      }
+    };
+    extractPublicIds(product);
+
+    if (pathsToDelete.length > 0) {
+      try {
+        const supabase = require('../utils/supabase');
+        const { error: storageError } = await supabase.storage
+          .from('vishwakarma')
+          .remove(pathsToDelete);
+        
+        if (storageError) {
+          console.error('Error deleting product files from Supabase Storage:', storageError.message);
+        } else {
+          console.log(`Successfully deleted ${pathsToDelete.length} files from Supabase Storage for product: ${product.name}`);
+        }
+      } catch (err) {
+        console.error('Failed to remove storage files during product deletion:', err.message || err);
+      }
+    }
+
+    // Hard delete from database
+    await Product.findByIdAndDelete(req.params.id);
 
     cache.clear('products:');
 
